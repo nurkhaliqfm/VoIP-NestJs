@@ -1,6 +1,9 @@
 import { Injectable, Logger, OnModuleDestroy } from '@nestjs/common';
 import type { Server as HttpServer } from 'http';
-import HotelVoIPManager from 'src/common/utils/socket.util';
+import * as path from 'path';
+import * as fs from 'fs';
+import { HotelVoIPManager, RoomDataDTO } from 'src/common';
+import { ReceptionistDataDTO } from 'src/common/dto/receptionist.dto';
 
 @Injectable()
 export class VoipService implements OnModuleDestroy {
@@ -11,22 +14,33 @@ export class VoipService implements OnModuleDestroy {
     return { message: 'VoIP Server is running!', status: 'ok' };
   }
 
-  /**
-   * Initialize the HotelVoIPManager once the Nest HTTP server exists.
-   * Safe to call multiple times; initialization is idempotent.
-   */
+  getRooms(): Array<RoomDataDTO> {
+    const roomsPath = path.join(__dirname, '../../database/rooms.json');
+    const rooms = JSON.parse(
+      fs.readFileSync(roomsPath, 'utf-8'),
+    ) as Array<RoomDataDTO>;
+
+    return rooms;
+  }
+
+  getReceptionists(): Array<ReceptionistDataDTO> {
+    const receptionistsPath = path.join(
+      __dirname,
+      '../../database/receptionist.json',
+    );
+    const receptionists = JSON.parse(
+      fs.readFileSync(receptionistsPath, 'utf-8'),
+    ) as Array<ReceptionistDataDTO>;
+
+    console.log(receptionists);
+
+    return receptionists;
+  }
+
   init(server?: HttpServer): void {
     if (!this.manager) {
       this.manager = new HotelVoIPManager(server);
     }
-  }
-
-  getManager(): HotelVoIPManager | undefined {
-    return this.manager;
-  }
-
-  getIO() {
-    return this.manager?.getIO();
   }
 
   onModuleDestroy(): void {
