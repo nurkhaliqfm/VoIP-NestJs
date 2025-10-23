@@ -1,0 +1,50 @@
+[
+  {
+    "id": 1,
+    "name": "Kamar 101",
+    "slug": "kamar-101",
+    "floor": 1,
+    "status": "AVAILABLE",
+    "fingerprint": "A1:B2:C3:D4:E5:F6:01:02"
+  },
+  {
+    "id": 2,
+    "name": "Kamar 102",
+    "slug": "kamar-102",
+    "floor": 1,
+    "status": "AVAILABLE",
+    "fingerprint": "A2:B3:C4:D5:E6:F7:02:03"
+  },
+  {
+    "id": 3,
+    "name": "Kamar 201",
+    "slug": "kamar-201",
+    "floor": 2,
+    "status": "AVAILABLE",
+    "fingerprint": "A3:B4:C5:D6:E7:F8:03:04"
+  },
+  {
+    "id": 4,
+    "name": "Kamar 202",
+    "slug": "kamar-202",
+    "floor": 2,
+    "status": "OCCUPIED",
+    "fingerprint": "A4:B5:C6:D7:E8:F9:04:05"
+  },
+  {
+    "id": 5,
+    "name": "Kamar 301",
+    "slug": "kamar-301",
+    "floor": 3,
+    "status": "OCCUPIED",
+    "fingerprint": "A5:B6:C7:D8:E9:FA:05:06"
+  },
+  {
+    "id": 6,
+    "name": "Kamar 302",
+    "slug": "kamar-302",
+    "floor": 3,
+    "status": "OCCUPIED",
+    "fingerprint": "A6:B7:C8:D9:EA:FB:06:07"
+  }
+]
