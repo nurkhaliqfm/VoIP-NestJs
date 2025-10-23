@@ -6,16 +6,37 @@ import {
 import { createServer } from 'http';
 import type { Server as HttpServer } from 'http';
 import { Logger } from '@nestjs/common';
+import * as path from 'path';
+import * as fs from 'fs';
+import { ReceptionistDataDTO } from '../dto/receptionist.dto';
+import { RoomDataDTO } from '../dto';
+import { GuestDataDTO } from '../dto/guest.dto';
 
 type TypedSocket = IOSocket<DefaultEventsMap>;
 type TypedServer = IOServer<DefaultEventsMap>;
+type CallbackResponse = {
+  name: string;
+  status: string;
+  message: string;
+  socket?: { id: string; user: string; type: 'guest' | 'receptionist' };
+};
 
 export class HotelVoIPManager {
   private readonly logger: Logger = new Logger(HotelVoIPManager.name);
 
   private io: TypedServer;
-  private receptionistSocket: string | null = null;
-  private callDeviceSocket: Record<string, string> = {};
+  // private receptionistSocket: Record<
+  //   string,
+  //   { socket_id: string; type: 'guest' | 'receptionist' }
+  // > = {};
+  // private guestSocket: Record<
+  //   string,
+  //   { socket_id: string; type: 'guest' | 'receptionist' }
+  // > = {};
+  private callDeviceSocket: Record<
+    string,
+    { socket_id: string; type: 'guest' | 'receptionist'; name: string }
+  > = {};
   private activeCalls: Map<
     string,
     { roomSocket: string; receptionistSocket: string; roomNumber: string }
@@ -38,215 +59,565 @@ export class HotelVoIPManager {
     this.io.on('connection', (socket: TypedSocket) => {
       this.logger.log(`Client connected: ${socket.id}`);
 
-      socket.on('register', (username: string) => {
-        this.callDeviceSocket[socket.id] = username;
-        this.logger.log(
-          `Device registered: ${username} with socket ${socket.id}`,
-        );
-      });
+      socket.on(
+        'register',
+        (
+          slug: string,
+          type: 'receptionist' | 'guest',
+          callback?: (response: CallbackResponse) => void,
+        ) => {
+          this.logger.log(
+            `Device registered: ${slug} with socket ${socket.id}`,
+          );
+
+          if (type === 'receptionist') {
+            const receptionistsPath = path.join(
+              __dirname,
+              '../../../database/receptionist.json',
+            );
+
+            const receptionists = JSON.parse(
+              fs.readFileSync(receptionistsPath, 'utf-8'),
+            ) as Array<ReceptionistDataDTO>;
+
+            const receptionistIndex = receptionists.findIndex(
+              (r) => r.slug === slug,
+            );
+
+            if (receptionistIndex !== -1) {
+              receptionists[receptionistIndex] = {
+                ...receptionists[receptionistIndex],
+                socket: socket.id,
+                updatedAt: new Date().toISOString(),
+              };
+
+              fs.writeFileSync(
+                receptionistsPath,
+                JSON.stringify(receptionists, null, 2),
+                'utf-8',
+              );
+
+              this.callDeviceSocket[slug] = {
+                name: receptionists[receptionistIndex].name,
+                type: type,
+                socket_id: socket.id,
+              };
+            } else {
+              this.logger.debug(`Receptionist with slug ${slug} not found`);
+            }
+          } else {
+            const guestPath = path.join(
+              __dirname,
+              '../../../database/guest.json',
+            );
+
+            const guests = JSON.parse(
+              fs.readFileSync(guestPath, 'utf-8'),
+            ) as Array<GuestDataDTO>;
+
+            const guestIndex = guests.findIndex((r) => r.slug === slug);
+
+            if (guestIndex !== -1) {
+              guests[guestIndex] = {
+                ...guests[guestIndex],
+                socket: socket.id,
+                updatedAt: new Date().toISOString(),
+              };
+
+              fs.writeFileSync(
+                guestPath,
+                JSON.stringify(guests, null, 2),
+                'utf-8',
+              );
+
+              this.callDeviceSocket[slug] = {
+                name: guests[guestIndex].room,
+                socket_id: socket.id,
+                type: type,
+              };
+            } else {
+              const roomsPath = path.join(
+                __dirname,
+                '../../../database/rooms.json',
+              );
+
+              const rooms = JSON.parse(
+                fs.readFileSync(roomsPath, 'utf-8'),
+              ) as Array<RoomDataDTO>;
+
+              const roomIndex = rooms.findIndex((r) => r.slug === slug);
+              if (roomIndex !== -1) {
+                this.callDeviceSocket[slug] = {
+                  name: rooms[roomIndex].name,
+                  socket_id: socket.id,
+                  type: type,
+                };
+
+                const newGuest = [
+                  ...guests,
+                  {
+                    room: rooms[roomIndex].name,
+                    socket: socket.id,
+                    slug: slug,
+                  },
+                ];
+
+                fs.writeFileSync(
+                  guestPath,
+                  JSON.stringify(newGuest, null, 2),
+                  'utf-8',
+                );
+              }
+            }
+          }
+
+          if (callback) {
+            callback({
+              name: 'register',
+              status: 'REGISTERED',
+              message: `Successfully registered as ${slug}`,
+              socket: {
+                id: socket.id,
+                user: slug,
+                type: type,
+              },
+            });
+          }
+        },
+      );
 
       socket.on(
-        'call',
-        ({ to, offer }: { to: string; offer: RTCSessionDescriptionInit }) => {
-          const targetSocketId = Object.keys(this.callDeviceSocket).find(
-            (key) => this.callDeviceSocket[key] === to,
+        'call:initiate',
+        (data: { to: string; type: 'receptionist' | 'guest' }) => {
+          const targetSocketKey = Object.keys(this.callDeviceSocket).find(
+            (key) =>
+              key === data.to && this.callDeviceSocket[key].type === data.type,
           );
-          if (targetSocketId) {
-            this.io.to(targetSocketId).emit('incomingCall', {
-              from: this.callDeviceSocket[socket.id],
-              offer,
+
+          const targetSocket = targetSocketKey
+            ? this.callDeviceSocket[targetSocketKey]
+            : undefined;
+
+          const fromSocketKey = Object.keys(this.callDeviceSocket).find(
+            (key) => this.callDeviceSocket[key].socket_id === socket.id,
+          );
+
+          const fromSocket = fromSocketKey
+            ? this.callDeviceSocket[fromSocketKey]
+            : undefined;
+
+          if (targetSocket && fromSocket) {
+            this.io.to(targetSocket.socket_id).emit('call:initiate', {
+              message: `Incoming Call From ${fromSocket.name}`,
+              status: 'initiate',
+              from: fromSocket,
+              to: targetSocket,
+              type: targetSocket.type,
             });
             this.logger.log(
-              `Call initiated from ${this.callDeviceSocket[socket.id]} to ${to}`,
+              `Call initiated from ${fromSocket.name} to ${targetSocket.name}`,
             );
           } else {
             socket.emit('call_error', { message: 'User not available' });
-            this.logger.warn(
-              `Call from ${this.callDeviceSocket[socket.id]} to ${to} failed: User not available`,
-            );
+            this.logger.warn(`Call offer failed: User not available`);
           }
         },
       );
 
       socket.on(
-        'answer',
-        (data: { to: string; answer: RTCSessionDescriptionInit }) => {
-          const targetSocketId = Object.keys(this.callDeviceSocket).find(
-            (key) => this.callDeviceSocket[key] === data.to,
+        'call:offer',
+        (data: { to: string; offer: RTCSessionDescriptionInit }) => {
+          const targetSocketKey = Object.keys(this.callDeviceSocket).find(
+            (key) => this.callDeviceSocket[key].socket_id === data.to,
           );
-          if (targetSocketId) {
-            this.io.to(targetSocketId).emit('callAnswered', {
-              from: this.callDeviceSocket[socket.id],
-              answer: data.answer,
+
+          const targetSocket = targetSocketKey
+            ? this.callDeviceSocket[targetSocketKey]
+            : undefined;
+
+          const fromSocketKey = Object.keys(this.callDeviceSocket).find(
+            (key) => this.callDeviceSocket[key].socket_id === socket.id,
+          );
+
+          const fromSocket = fromSocketKey
+            ? this.callDeviceSocket[fromSocketKey]
+            : undefined;
+
+          if (targetSocket && fromSocket && data.offer) {
+            this.io.to(targetSocket.socket_id).emit('call:offer', {
+              message: null,
+              status: 'offer',
+              from: fromSocket,
+              to: targetSocket,
+              type: targetSocket.type,
+              offer: data.offer,
             });
-            this.logger.log(
-              `Call answered by ${this.callDeviceSocket[socket.id]} to ${data.to}`,
-            );
+            this.logger.log(`Call Accepted by ${fromSocket.name} `);
+          } else {
+            socket.emit('call_error', { message: 'User not available' });
+            this.logger.warn(`Call accepted failed: User not available`);
+          }
+        },
+      );
+
+      socket.on('call:reject', (data: { to: string }) => {
+        const targetSocketKey = Object.keys(this.callDeviceSocket).find(
+          (key) => this.callDeviceSocket[key].socket_id === data.to,
+        );
+
+        const targetSocket = targetSocketKey
+          ? this.callDeviceSocket[targetSocketKey]
+          : undefined;
+
+        const fromSocketKey = Object.keys(this.callDeviceSocket).find(
+          (key) => this.callDeviceSocket[key].socket_id === socket.id,
+        );
+
+        const fromSocket = fromSocketKey
+          ? this.callDeviceSocket[fromSocketKey]
+          : undefined;
+
+        if (targetSocket && fromSocket) {
+          this.io.to(targetSocket.socket_id).emit('call:reject', {
+            message: `Call Rejected by ${fromSocket.name}`,
+            status: 'reject',
+            from: fromSocket,
+            to: targetSocket,
+            type: targetSocket.type,
+          });
+          this.logger.log(`Call Rejected by ${fromSocket.name} `);
+        } else {
+          socket.emit('call_error', { message: 'User not available' });
+          this.logger.warn(`Call reject failed: User not available`);
+        }
+      });
+
+      socket.on(
+        'call:stop',
+        (data: { to: string; type: 'receptionist' | 'guest' }) => {
+          const targetSocketKey = Object.keys(this.callDeviceSocket).find(
+            (key) =>
+              key === data.to && this.callDeviceSocket[key].type === data.type,
+          );
+
+          const targetSocket = targetSocketKey
+            ? this.callDeviceSocket[targetSocketKey]
+            : undefined;
+
+          const fromSocketKey = Object.keys(this.callDeviceSocket).find(
+            (key) => this.callDeviceSocket[key].socket_id === socket.id,
+          );
+
+          const fromSocket = fromSocketKey
+            ? this.callDeviceSocket[fromSocketKey]
+            : undefined;
+
+          if (targetSocket && fromSocket) {
+            this.io.to(targetSocket.socket_id).emit('call:stop', {
+              message: `Call Stopped by ${fromSocket.name}`,
+              status: 'stop',
+              from: fromSocket,
+              to: targetSocket,
+              type: targetSocket.type,
+            });
+            this.logger.log(`Call Stopped by ${fromSocket.name} `);
+          } else {
+            socket.emit('call_error', { message: 'User not available' });
+            this.logger.warn(`Call stop failed: User not available`);
           }
         },
       );
 
       socket.on(
-        'iceCandidate',
-        (data: { to: string; candidate: RTCIceCandidateInit }) => {
-          const targetSocketId = Object.keys(this.callDeviceSocket).find(
-            (key) => this.callDeviceSocket[key] === data.to,
+        'call:end',
+        (data: { to: string; type: 'receptionist' | 'guest' }) => {
+          const targetSocketKey = Object.keys(this.callDeviceSocket).find(
+            (key) => this.callDeviceSocket[key].socket_id === data.to,
           );
-          if (targetSocketId) {
-            this.io.to(targetSocketId).emit('iceCandidate', {
-              from: this.callDeviceSocket[socket.id],
+
+          const targetSocket = targetSocketKey
+            ? this.callDeviceSocket[targetSocketKey]
+            : undefined;
+
+          const fromSocketKey = Object.keys(this.callDeviceSocket).find(
+            (key) => this.callDeviceSocket[key].socket_id === socket.id,
+          );
+
+          const fromSocket = fromSocketKey
+            ? this.callDeviceSocket[fromSocketKey]
+            : undefined;
+
+          if (targetSocket && fromSocket) {
+            this.io.to(targetSocket.socket_id).emit('call:end', {
+              message: `Call Ended by ${fromSocket.name}`,
+              status: 'end',
+              from: fromSocket,
+              to: targetSocket,
+              type: targetSocket.type,
+            });
+            this.logger.log(`Call Ended by ${fromSocket.name} `);
+          } else {
+            socket.emit('call_error', { message: 'User not available' });
+            this.logger.warn(`Call end failed: User not available`);
+          }
+        },
+      );
+
+      socket.on(
+        'call:answer',
+        (data: { to: string; answer: RTCSessionDescriptionInit }) => {
+          console.log('Call accept data:', data.to, data.answer);
+
+          const targetSocketKey = Object.keys(this.callDeviceSocket).find(
+            (key) => this.callDeviceSocket[key].socket_id === data.to,
+          );
+
+          const targetSocket = targetSocketKey
+            ? this.callDeviceSocket[targetSocketKey]
+            : undefined;
+
+          const fromSocketKey = Object.keys(this.callDeviceSocket).find(
+            (key) => this.callDeviceSocket[key].socket_id === socket.id,
+          );
+
+          const fromSocket = fromSocketKey
+            ? this.callDeviceSocket[fromSocketKey]
+            : undefined;
+
+          if (targetSocket && fromSocket) {
+            this.io.to(targetSocket.socket_id).emit('call:answer', {
+              from: fromSocket.socket_id,
+              answer: data.answer,
+              status: 'offer',
+            });
+            this.logger.log(`Call answered ${targetSocket.name}`);
+          }
+        },
+      );
+
+      // socket.on(
+      //   'makeCall',
+      //   ({
+      //     from,
+      //     from_type,
+      //     to,
+      //     to_type,
+      //     offer,
+      //     callback,
+      //   }: {
+      //     from: string;
+      //     from_type: 'receptionist' | 'guest';
+      //     to: string;
+      //     to_type: 'receptionist' | 'guest';
+      //     offer: RTCSessionDescriptionInit;
+      //     callback?: (response: CallbackResponse) => void;
+      //   }) => {
+      //     const targetSocketKey = Object.keys(this.callDeviceSocket).find(
+      //       (key) => key === to && this.callDeviceSocket[key].type === to_type,
+      //     );
+
+      //     const targetSocket = targetSocketKey
+      //       ? this.callDeviceSocket[targetSocketKey]
+      //       : undefined;
+
+      //     const fromSocketKey = Object.keys(this.callDeviceSocket).find(
+      //       (key) =>
+      //         key === from && this.callDeviceSocket[key].type === from_type,
+      //     );
+
+      //     const fromSocket = fromSocketKey
+      //       ? this.callDeviceSocket[fromSocketKey]
+      //       : undefined;
+
+      //     if (targetSocket && fromSocket) {
+      //       this.io.to(targetSocket.socket_id).emit('incomingCall', {
+      //         status: 'INCOMING_CALL',
+      //         from: fromSocket.socket_id,
+      //         offer,
+      //       });
+      //       this.logger.log(`Call initiated from ${from} to ${to}`);
+      //     } else {
+      //       socket.emit('call_error', { message: 'User not available' });
+      //       this.logger.warn(
+      //         `Call from ${from} to ${to} failed: User not available`,
+      //       );
+      //     }
+
+      //     if (callback) {
+      //       callback({
+      //         name: 'call',
+      //         status: 'CALL_REQUESTED',
+      //         message: 'Call request processed',
+      //       });
+      //     }
+      //   },
+      // );
+
+      // socket.on(
+      //   'incomingCallAnswered',
+      //   ({
+      //     from,
+      //     from_type,
+      //     to,
+      //     to_type,
+      //     offer,
+      //     callback,
+      //   }: {
+      //     from: string;
+      //     from_type: 'receptionist' | 'guest';
+      //     to: string;
+      //     to_type: 'receptionist' | 'guest';
+      //     offer: RTCSessionDescriptionInit;
+      //     callback?: (response: CallbackResponse) => void;
+      //   }) => {
+      //     const targetSocketKey = Object.keys(this.callDeviceSocket).find(
+      //       (key) => key === to && this.callDeviceSocket[key].type === to_type,
+      //     );
+
+      //     const targetSocket = targetSocketKey
+      //       ? this.callDeviceSocket[targetSocketKey]
+      //       : undefined;
+
+      //     const fromSocketKey = Object.keys(this.callDeviceSocket).find(
+      //       (key) =>
+      //         key === from && this.callDeviceSocket[key].type === from_type,
+      //     );
+
+      //     const fromSocket = fromSocketKey
+      //       ? this.callDeviceSocket[fromSocketKey]
+      //       : undefined;
+
+      //     if (targetSocket && fromSocket) {
+      //       this.io.to(targetSocket.socket_id).emit('incomingCallAnswered', {
+      //         status: 'INCOMING_CALL',
+      //         from: fromSocket.socket_id,
+      //         offer,
+      //       });
+      //       this.logger.log(`Call initiated from ${from} to ${to}`);
+      //     } else {
+      //       socket.emit('call_error', { message: 'User not available' });
+      //       this.logger.warn(
+      //         `Call from ${from} to ${to} failed: User not available`,
+      //       );
+      //     }
+
+      //     if (callback) {
+      //       callback({
+      //         name: 'call',
+      //         status: 'INCOMING_CALL_ANSWERED',
+      //         message: 'Call request processed',
+      //       });
+      //     }
+      //   },
+      // );
+
+      // socket.on(
+      //   'declineCall',
+      //   (
+      //     data: { to: string; reason?: string },
+      //     callback?: (response: CallbackResponse) => void,
+      //   ) => {
+      //     console.log('Call declined:', data);
+      //     const targetSocketKey = Object.keys(this.callDeviceSocket).find(
+      //       (key) => this.callDeviceSocket[key].socket_id === data.to,
+      //     );
+
+      //     const targetSocket = targetSocketKey
+      //       ? this.callDeviceSocket[targetSocketKey]
+      //       : undefined;
+
+      //     const fromSocketKey = Object.keys(this.callDeviceSocket).find(
+      //       (key) => this.callDeviceSocket[key].socket_id === socket.id,
+      //     );
+
+      //     const fromSocket = fromSocketKey
+      //       ? this.callDeviceSocket[fromSocketKey]
+      //       : undefined;
+
+      //     if (targetSocket && fromSocket) {
+      //       this.io.to(targetSocket.socket_id).emit('callDeclined', {
+      //         from: fromSocket.socket_id,
+      //         reason: data.reason || 'Call declined',
+      //       });
+      //       this.logger.log(`Call declined by ${fromSocketKey}`);
+      //     }
+
+      //     if (callback) {
+      //       callback({
+      //         name: 'declineCall',
+      //         status: 'CALL_DECLINED',
+      //         message: 'Call decline processed',
+      //       });
+      //     }
+      //   },
+      // );
+
+      socket.on(
+        'call:candidate',
+        (data: { to: string; candidate: RTCIceCandidateInit }) => {
+          const targetSocketKey = Object.keys(this.callDeviceSocket).find(
+            (key) => this.callDeviceSocket[key].socket_id === data.to,
+          );
+
+          const targetSocket = targetSocketKey
+            ? this.callDeviceSocket[targetSocketKey]
+            : undefined;
+
+          const fromSocketKey = Object.keys(this.callDeviceSocket).find(
+            (key) => this.callDeviceSocket[key].socket_id === socket.id,
+          );
+
+          const fromSocket = fromSocketKey
+            ? this.callDeviceSocket[fromSocketKey]
+            : undefined;
+
+          if (targetSocket && fromSocket) {
+            this.io.to(targetSocket.socket_id).emit('call:candidate', {
+              from: fromSocket.socket_id,
               candidate: data.candidate,
             });
-            this.logger.log(
-              `ICE candidate sent from ${this.callDeviceSocket[socket.id]} to ${data.to}`,
-            );
+            this.logger.log(`ICE candidate sent `);
           }
         },
       );
 
       socket.on('disconnect', () => {
         this.logger.log(`Client disconnected: ${socket.id}`);
-        for (const [user, id] of Object.entries(this.callDeviceSocket)) {
-          if (id === socket.id) delete this.callDeviceSocket[user];
+        for (const [user, data] of Object.entries(this.callDeviceSocket)) {
+          if (data.socket_id === socket.id) {
+            if (data.type === 'receptionist') {
+              const receptionistsPath = path.join(
+                __dirname,
+                '../../../database/receptionist.json',
+              );
+
+              const receptionists = JSON.parse(
+                fs.readFileSync(receptionistsPath, 'utf-8'),
+              ) as Array<ReceptionistDataDTO>;
+
+              const receptionistIndex = receptionists.findIndex(
+                (r) => r.socket === socket.id,
+              );
+
+              if (receptionistIndex !== -1) {
+                receptionists[receptionistIndex] = {
+                  ...receptionists[receptionistIndex],
+                  socket: '',
+                  updatedAt: new Date().toISOString(),
+                };
+
+                fs.writeFileSync(
+                  receptionistsPath,
+                  JSON.stringify(receptionists, null, 2),
+                  'utf-8',
+                );
+              }
+            }
+
+            delete this.callDeviceSocket[user];
+          }
         }
       });
-
-      // // Register as receptionist
-      // socket.on('register_receptionist', () => {
-      //   this.receptionistSocket = socket.id;
-      //   this.logger.log(`Receptionist registered: ${socket.id}`);
-      // });
-
-      // // Room starts a call to reception
-      // socket.on(
-      //   'start_call',
-      //   (data: { roomNumber: string; guestName?: string }) => {
-      //     if (!this.receptionistSocket) {
-      //       socket.emit('call_failed', {
-      //         reason: 'Receptionist not available',
-      //       });
-      //       return;
-      //     }
-
-      //     const callId = `call_${Date.now()}_${data.roomNumber}`;
-      //     this.activeCalls.set(callId, {
-      //       roomSocket: socket.id,
-      //       receptionistSocket: this.receptionistSocket,
-      //       roomNumber: data.roomNumber,
-      //     });
-
-      //     // Notify receptionist of incoming call
-      //     this.io.to(this.receptionistSocket).emit('incoming_call', {
-      //       roomNumber: data.roomNumber,
-      //       guestName: data.guestName,
-      //       callId,
-      //     });
-      //   },
-      // );
-
-      // // Receptionist accepts call
-      // socket.on('accept_call', (data: { callId: string }) => {
-      //   const call = this.activeCalls.get(data.callId);
-      //   if (call) {
-      //     this.io
-      //       .to(call.roomSocket)
-      //       .emit('call_accepted', { callId: data.callId });
-      //   }
-      // });
-
-      // // Receptionist rejects call
-      // socket.on('reject_call', (data: { callId: string }) => {
-      //   const call = this.activeCalls.get(data.callId);
-      //   if (call) {
-      //     this.io
-      //       .to(call.roomSocket)
-      //       .emit('call_rejected', { callId: data.callId });
-      //     this.activeCalls.delete(data.callId);
-      //   }
-      // });
-
-      // // End call
-      // socket.on('end_call', (data: { callId: string }) => {
-      //   const call = this.activeCalls.get(data.callId);
-      //   if (call) {
-      //     // Notify both parties
-      //     this.io
-      //       .to(call.roomSocket)
-      //       .emit('call_ended', { callId: data.callId });
-      //     this.io
-      //       .to(call.receptionistSocket)
-      //       .emit('call_ended', { callId: data.callId });
-      //     this.activeCalls.delete(data.callId);
-      //   }
-      // });
-
-      // // WebRTC signaling
-      // socket.on(
-      //   'offer',
-      //   (data: { offer: RTCSessionDescriptionInit; callId: string }) => {
-      //     const call = this.activeCalls.get(data.callId);
-      //     if (call) {
-      //       const targetSocket =
-      //         socket.id === call.roomSocket
-      //           ? call.receptionistSocket
-      //           : call.roomSocket;
-      //       this.io.to(targetSocket).emit('offer', data);
-      //     }
-      //   },
-      // );
-
-      // socket.on(
-      //   'answer',
-      //   (data: { answer: RTCSessionDescriptionInit; callId: string }) => {
-      //     const call = this.activeCalls.get(data.callId);
-      //     if (call) {
-      //       const targetSocket =
-      //         socket.id === call.roomSocket
-      //           ? call.receptionistSocket
-      //           : call.roomSocket;
-      //       this.io.to(targetSocket).emit('answer', data);
-      //     }
-      //   },
-      // );
-
-      // socket.on(
-      //   'ice_candidate',
-      //   (data: { candidate: RTCIceCandidateInit; callId: string }) => {
-      //     const call = this.activeCalls.get(data.callId);
-      //     if (call) {
-      //       const targetSocket =
-      //         socket.id === call.roomSocket
-      //           ? call.receptionistSocket
-      //           : call.roomSocket;
-      //       this.io.to(targetSocket).emit('ice_candidate', data);
-      //     }
-      //   },
-      // );
-
-      // socket.on('disconnect', () => {
-      //   this.logger.log(`Client disconnected: ${socket.id}`);
-
-      //   // If receptionist disconnects
-      //   if (socket.id === this.receptionistSocket) {
-      //     this.receptionistSocket = null;
-      //     // End all active calls
-      //     for (const [callId, call] of this.activeCalls.entries()) {
-      //       this.io.to(call.roomSocket).emit('call_ended', { callId });
-      //     }
-      //     this.activeCalls.clear();
-      //   } else {
-      //     // If room disconnects, end their active call
-      //     for (const [callId, call] of this.activeCalls.entries()) {
-      //       if (call.roomSocket === socket.id) {
-      //         this.io
-      //           .to(call.receptionistSocket)
-      //           .emit('call_ended', { callId });
-      //         this.activeCalls.delete(callId);
-      //         break;
-      //       }
-      //     }
-      //   }
-      // });
     });
   }
 
@@ -254,16 +625,16 @@ export class HotelVoIPManager {
     return this.io;
   }
 
-  public getActiveCalls(): Array<{ roomNumber: string; callId: string }> {
-    return Array.from(this.activeCalls.entries()).map(([callId, call]) => ({
-      callId,
-      roomNumber: call.roomNumber,
-    }));
-  }
+  // public getActiveCalls(): Array<{ roomNumber: string; callId: string }> {
+  //   return Array.from(this.activeCalls.entries()).map(([callId, call]) => ({
+  //     callId,
+  //     roomNumber: call.roomNumber,
+  //   }));
+  // }
 
-  public isReceptionistOnline(): boolean {
-    return this.receptionistSocket !== null;
-  }
+  // public isReceptionistOnline(): boolean {
+  //   return this.receptionistSocket !== null;
+  // }
 }
 
 export default HotelVoIPManager;
